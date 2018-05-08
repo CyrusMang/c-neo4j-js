@@ -2,29 +2,33 @@
 
 import url from 'url'
 import http from 'http'
+import querystring from 'querystring'
 
-const query = (auth, _url, statements) => {
+const query = (auth, method, _url, data) => {
     _url = url.parse(_url)
     let options = {
         host: _url.hostname,
         port: _url.port,
         path: _url.path,
         auth: auth,
-        method: (statements) ? 'POST' : 'GET',
+        method: method,
         headers: {
             'Accept': 'application/json; charset=UTF-8',
             'Connection': 'keep-alive',
             'X-Stream': 'true'
         }
     }
-    if (statements){
-        statements = JSON.stringify(statements)
+    if (['PUT', 'PATCH', 'POST'].includes(method)){
+        data = JSON.stringify(data)
         options.headers['Content-Type'] = 'application/json'
-        options.headers['Content-Length'] = statements.length
+        options.headers['Content-Length'] = data.length
+    } else {
+        if (data) {
+            options.path = `${options.path}?${querystring.stringify(data)}`
+        }
     }
     return new Promise((resolve, reject) => {
         let str = ''
-        
         const req = http.request(options, res => {
             res.body = ''
             res.on('data', chunk => str += chunk)
@@ -34,11 +38,20 @@ const query = (auth, _url, statements) => {
             })
         })
         req.on('error', error => reject(error))
-        if (statements){
-            req.write(statements)
+        if (['PUT', 'PATCH', 'POST'].includes(method)){
+            req.write(data)
         }
         req.end()
     })
+}
+
+export const stringify = data => {
+    for (let [k, v] of Object.entries(data)) {
+        if (!['boolean', 'number', 'string'].includes(typeof v)) {
+            data[k] = encodeURI(JSON.stringify(v))
+        }
+    }
+    return data
 }
 
 export default class Database{
@@ -65,7 +78,7 @@ export default class Database{
                 parameters: params
             }]
         }
-        const response = await query(this.auth, url, statements)
+        const response = await query(this.auth, 'POST', url, statements)
         if (response.body.errors.length) {
             let messages = ''
             for (let error of response.body.errors){
@@ -98,7 +111,7 @@ export default class Database{
         if (this._transaction[0] > 1) {
             --this._transaction[0]
         } else if (this._transaction[0] == 1 && this._transaction[1]) {
-            const response = await query(this.auth, `${this._transaction[1]}/commit`, {statements:[]})
+            const response = await query(this.auth, 'POST', `${this._transaction[1]}/commit`, {statements:[]})
             if (response.body.errors.length) {
                 let messages = ''
                 for (let error of response.body.errors) {
@@ -113,8 +126,32 @@ export default class Database{
             throw new Error('No statement exist.')
         }
     }
+    async rollback() {
+        const response = await query(this.auth, 'DELETE', this._transaction[1])
+        if (response.body.errors.length) {
+            let messages = ''
+            for (let error of response.body.errors) {
+                messages += error.message
+            }
+            throw new Error(`Database error : ${messages}`)
+        } else {
+            this._transaction = [0]
+            return true
+        }
+    }
     static async connect(configs) {
-        const res = await query(configs.auth, configs.url)
-        return () => new Database(res.body, configs.auth)
+        try {
+            const response = await query(configs.auth, 'GET', configs.url)
+            return () => new Database(response.body, configs.auth)
+        } catch (e) {
+            if (e.code === 'ECONNREFUSED') {
+                return new Promise(resolve => {
+                    setTimeout(() => {
+                        resolve(this.connect(configs))
+                    }, 10000)
+                })
+            }
+            throw e
+        }
     }
 }
